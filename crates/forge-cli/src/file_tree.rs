@@ -69,6 +69,32 @@ impl FileTreeState {
         self.rebuild_visible();
     }
 
+    /// Re-scan the directory, preserving the user's current expand/collapse state.
+    /// Called on receiving FS events from NATS.
+    pub fn refresh(&mut self, root_path: &Path) {
+        // Snapshot which directories were expanded before the rescan.
+        let expanded: std::collections::HashSet<PathBuf> = self
+            .visible
+            .iter()
+            .filter(|n| n.is_dir && n.expanded)
+            .map(|n| n.path.clone())
+            .collect();
+
+        self.root = Some(scan_directory(root_path, 0, 2));
+        if let Some(ref mut root) = self.root {
+            root.expanded = true;
+            // Restore previously expanded dirs.
+            for path in &expanded {
+                set_expanded(root, path, true);
+            }
+        }
+        self.rebuild_visible();
+        // Clamp selection in case items were removed.
+        if !self.visible.is_empty() && self.selected >= self.visible.len() {
+            self.selected = self.visible.len().saturating_sub(1);
+        }
+    }
+
     /// Rebuild the flattened visible list from the tree.
     pub fn rebuild_visible(&mut self) {
         self.visible.clear();

@@ -1,7 +1,7 @@
 //! Terminal emulation state — wraps alacritty_terminal for VT100 processing.
 
 use alacritty_terminal::event::VoidListener;
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::{Config as TermConfig, Term};
 use alacritty_terminal::vte::ansi::Processor;
 
@@ -80,5 +80,20 @@ impl TerminalState {
     /// Number of screen lines.
     pub fn screen_lines(&self) -> usize {
         self.term.screen_lines()
+    }
+
+    /// Scroll the viewport up (into scrollback history) by one page.
+    pub fn scroll_up(&mut self) {
+        self.term.scroll_display(Scroll::PageUp);
+    }
+
+    /// Scroll the viewport down (toward current output) by one page.
+    pub fn scroll_down(&mut self) {
+        self.term.scroll_display(Scroll::PageDown);
+    }
+
+    /// Reset scroll position to the bottom (live output).
+    pub fn scroll_to_bottom(&mut self) {
+        self.term.scroll_display(Scroll::Bottom);
     }
 }

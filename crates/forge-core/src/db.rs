@@ -225,6 +225,28 @@ pub fn force_release_lock(conn: &Connection, path: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn update_agent_working_dir(conn: &Connection, id: &AgentId, working_dir: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE agents SET working_dir = ?1 WHERE id = ?2",
+        params![working_dir, id.as_str()],
+    )?;
+    Ok(())
+}
+
+/// Return paths of locks acquired more than `older_than_secs` seconds ago.
+pub fn get_stale_lock_paths(conn: &Connection, older_than_secs: u64) -> Result<Vec<String>> {
+    let interval = format!("-{older_than_secs} seconds");
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT path FROM file_locks \
+         WHERE acquired_at < datetime('now', ?1)",
+    )?;
+    let paths = stmt
+        .query_map([&interval], |row| row.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(paths)
+}
+
 pub fn get_all_locks(
     conn: &Connection,
 ) -> Result<Vec<(String, AgentId, LockMode, String)>> {

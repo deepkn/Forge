@@ -6,9 +6,11 @@ use crate::supervisor::Supervisor;
 use anyhow::Result;
 use futures_util::StreamExt;
 use forge_core::config::{AgentType, ForgeConfig};
-use forge_core::protocol::{AgentStateEvent, CoordinatorCommand, CoordinatorNotification, SessionSnapshot};
+use forge_core::protocol::{AgentStateEvent, CoordinatorCommand, CoordinatorNotification, FsAction, FsEvent, SessionSnapshot};
 use forge_core::subjects::{AgentSubjects, CoordinatorInbox, CoordinatorSubjects, SessionSubjects};
 use forge_core::types::{AgentColor, AgentHost, AgentId, AgentInfo, AgentState};
+use forge_core::db;
+use rusqlite::Connection;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,6 +33,7 @@ pub async fn run(
     config: ForgeConfig,
     workdir: PathBuf,
     _lock_handle: LockManagerHandle,
+    db: Arc<std::sync::Mutex<Connection>>,
 ) -> Result<()> {
     let agents: Arc<Mutex<HashMap<String, AgentEntry>>> = Arc::new(Mutex::new(HashMap::new()));
 
@@ -50,6 +53,11 @@ pub async fn run(
     )
     .await?;
     info!("Coordinator agent spawned: {}", coord_id);
+
+    // Start filesystem watcher — watches workdir and publishes FsEvent to NATS.
+    // The coordinator's fs subject (forge.agent.{coord_id}.fs) carries system-level events;
+    // individual agents report their own changes via forge_notify_done.
+    start_fs_watcher(nats.clone(), workdir.clone(), coord_id.clone());
 
     // Subscribe to coordinator commands
     let mut cmd_sub = nats.subscribe(CoordinatorSubjects::command()).await?;
@@ -74,6 +82,7 @@ pub async fn run(
     let nats_for_session = nats.clone();
     let nats_for_notif = nats.clone();
     let coord_id_for_notif = coord_id.clone();
+    let db_for_stdout: Arc<std::sync::Mutex<Connection>> = Arc::clone(&db);
 
     // Handle state changes in background
     tokio::spawn(async move {
@@ -111,18 +120,56 @@ pub async fn run(
         }
     });
 
-    // Buffer agent stdout output in background
+    // Buffer agent stdout output in background + detect state changes + track cwd
+    let nats_for_state_detect = nats.clone();
     tokio::spawn(async move {
         while let Some(msg) = stdout_sub.next().await {
             if let Some(agent_id) = extract_agent_id(&msg.subject) {
                 let mut agents = agents_for_stdout.lock().await;
                 if let Some(entry) = agents.get_mut(&agent_id) {
-                    // Convert bytes to string, split into lines, buffer them
                     let text = String::from_utf8_lossy(&msg.payload);
+
+                    // Check for OSC 7 (cwd tracking): \x1b]7;file://hostname/path\x07
+                    if let Some(cwd) = extract_osc7_cwd(&text) {
+                        if entry.info.working_dir != cwd {
+                            entry.info.working_dir = cwd.clone();
+                            // Persist to SQLite so attach sessions see the latest cwd.
+                            let conn = db_for_stdout.lock().unwrap();
+                            let _ = db::update_agent_working_dir(&conn, &entry.info.id, &cwd);
+                        }
+                    }
+
+                    // Buffer lines and detect state changes
                     for line in text.lines() {
                         entry.output_buffer.push_back(line.to_string());
                         if entry.output_buffer.len() > OUTPUT_BUFFER_LINES {
                             entry.output_buffer.pop_front();
+                        }
+
+                        // State detection via output heuristics
+                        if let Some(new_state) = crate::state_detector::detect_state(line) {
+                            let current = &entry.info.state;
+                            // Only allow sensible transitions
+                            let should_transition = match (&current, &new_state) {
+                                // Don't resurrect done/error agents
+                                (AgentState::Done, _) => false,
+                                (AgentState::Error, _) => false,
+                                // Allow all other transitions
+                                _ => true,
+                            };
+
+                            if should_transition && *current != new_state {
+                                entry.info.state = new_state.clone();
+                                let event = AgentStateEvent {
+                                    agent_id: AgentId(agent_id.clone()),
+                                    state: new_state,
+                                    message: Some(format!("Detected from output: {}", line.chars().take(80).collect::<String>())),
+                                };
+                                let payload = serde_json::to_vec(&event).unwrap();
+                                let _ = nats_for_state_detect
+                                    .publish(AgentSubjects::state(&AgentId(agent_id.clone())), payload.into())
+                                    .await;
+                            }
                         }
                     }
                 }
@@ -442,4 +489,142 @@ fn extract_agent_id(subject: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Extract working directory from OSC 7 escape sequence.
+///
+/// Modern shells (bash, zsh, fish) emit: `\x1b]7;file://hostname/path/to/dir\x07`
+/// to advertise the current working directory. This function parses the path out.
+fn extract_osc7_cwd(text: &str) -> Option<String> {
+    // Look for OSC 7 pattern: \x1b]7;file://... terminated by \x07 or \x1b\\
+    let osc_start = text.find("\x1b]7;")?;
+    let after_osc = &text[osc_start + 4..]; // skip \x1b]7;
+
+    // Find terminator: BEL (\x07) or ST (\x1b\\)
+    let end = after_osc.find('\x07')
+        .or_else(|| after_osc.find("\x1b\\"))?;
+
+    let uri = &after_osc[..end];
+
+    // Parse file:// URI
+    if let Some(path_start) = uri.strip_prefix("file://") {
+        // Skip hostname (everything up to the next /)
+        if let Some(slash_pos) = path_start.find('/') {
+            let path = &path_start[slash_pos..];
+            // URL-decode percent-encoded characters
+            let decoded = percent_decode(path);
+            if !decoded.is_empty() {
+                return Some(decoded);
+            }
+        }
+    }
+
+    None
+}
+
+/// Simple percent-decoding for file paths.
+fn percent_decode(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let hex: String = chars.by_ref().take(2).collect();
+            if hex.len() == 2 {
+                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                    result.push(byte as char);
+                    continue;
+                }
+            }
+            result.push('%');
+            result.push_str(&hex);
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+// ─── Filesystem Watcher ─────────────────────────────────────────────
+
+/// Start a background notify watcher on `workdir`.
+/// File system events are published as `FsEvent` to `forge.agent.{coord_id}.fs`.
+fn start_fs_watcher(nats: async_nats::Client, workdir: PathBuf, coord_id: AgentId) {
+    use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+    use notify::event::{CreateKind, ModifyKind, RemoveKind};
+
+    let (sync_tx, sync_rx) = std::sync::mpsc::channel::<notify::Event>();
+    let mut watcher = match RecommendedWatcher::new(
+        move |res: notify::Result<notify::Event>| {
+            if let Ok(ev) = res {
+                let _ = sync_tx.send(ev);
+            }
+        },
+        notify::Config::default(),
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            warn!("Failed to create fs watcher: {e}");
+            return;
+        }
+    };
+
+    if let Err(e) = watcher.watch(&workdir, RecursiveMode::Recursive) {
+        warn!("Failed to watch {}: {e}", workdir.display());
+        return;
+    }
+
+    info!("Filesystem watcher started on {}", workdir.display());
+
+    // Bridge sync notify channel → async NATS publishes via a blocking thread.
+    let (async_tx, mut async_rx) = tokio::sync::mpsc::unbounded_channel::<notify::Event>();
+    std::thread::spawn(move || {
+        let _watcher = watcher; // keep watcher alive for this thread's lifetime
+        for event in sync_rx {
+            if async_tx.send(event).is_err() {
+                break;
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        let subject = AgentSubjects::fs(&coord_id);
+        while let Some(event) = async_rx.recv().await {
+            // Map notify EventKind to FsAction; skip events we don't care about.
+            let action = match &event.kind {
+                EventKind::Create(CreateKind::File) | EventKind::Create(_) => FsAction::Create,
+                EventKind::Modify(ModifyKind::Name(_)) => FsAction::Modify,
+                EventKind::Modify(_) => FsAction::Modify,
+                EventKind::Remove(RemoveKind::File) | EventKind::Remove(_) => FsAction::Delete,
+                EventKind::Access(_) | EventKind::Other | EventKind::Any => continue,
+            };
+
+            for path in &event.paths {
+                let path_str = path.to_string_lossy().to_string();
+
+                // Skip hidden dirs and build artefact dirs
+                if should_ignore_path(&path_str) {
+                    continue;
+                }
+
+                let fs_event = FsEvent {
+                    agent_id: coord_id.clone(),
+                    action: action.clone(),
+                    path: path_str,
+                };
+                if let Ok(payload) = serde_json::to_vec(&fs_event) {
+                    let _ = nats.publish(subject.clone(), payload.into()).await;
+                }
+            }
+        }
+    });
+}
+
+/// Return true if a path should be excluded from fs event broadcasting.
+fn should_ignore_path(path: &str) -> bool {
+    path.split('/').any(|seg| {
+        matches!(
+            seg,
+            ".git" | "target" | "node_modules" | ".forge-instructions.md"
+        )
+    })
 }

@@ -36,6 +36,10 @@ pub enum InputEvent {
     TreeToggle,
     /// Spawn a new subagent in the center pane.
     SpawnNewAgent,
+    /// Scroll the focused terminal up (into scrollback history).
+    ScrollUp,
+    /// Scroll the focused terminal down (toward current output).
+    ScrollDown,
     /// Enters command mode (Esc prefix).
     EnterCommandMode,
     /// Raw input forwarded to focused PTY.
@@ -141,6 +145,15 @@ pub fn map_key_event(key: KeyEvent, state: &mut InputState) -> Option<InputEvent
     // ─── Ctrl+Q quit ─────────────────────────────────────────────────────
     if ctrl && key.code == KeyCode::Char('q') {
         return Some(InputEvent::Quit);
+    }
+
+    // ─── Shift+PageUp/PageDown: scroll terminal history ──────────────────
+    if shift && !ctrl && !alt {
+        match key.code {
+            KeyCode::PageUp => return Some(InputEvent::ScrollUp),
+            KeyCode::PageDown => return Some(InputEvent::ScrollDown),
+            _ => {}
+        }
     }
 
     // ─── Everything else: raw input to focused PTY ───────────────────────

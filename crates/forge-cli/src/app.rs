@@ -12,7 +12,7 @@ use crossterm::terminal::{
 };
 use crossterm::ExecutableCommand;
 use forge_core::config::ForgeConfig;
-use forge_core::protocol::{AgentStateEvent, SessionSnapshot};
+use forge_core::protocol::{AgentStateEvent, FsEvent, SessionSnapshot};
 use forge_core::state_file::DaemonState;
 use forge_core::subjects::{AgentSubjects, SessionSubjects};
 use forge_core::types::{AgentId, AgentInfo};
@@ -133,6 +133,35 @@ impl App {
         self.coordinator_id.as_ref().map(|c| c.as_str()) == Some(id)
     }
 
+    /// Try to switch focus to whichever agent owns the given file path.
+    /// Checks active_edits first, then lock holders. No-ops if no agent is found.
+    fn focus_agent_for_path(&mut self, path: &str) {
+        let agent_id = self
+            .file_tree
+            .active_edits
+            .get(path)
+            .cloned()
+            .or_else(|| {
+                self.file_tree
+                    .locks
+                    .get(path)
+                    .and_then(|v| v.first())
+                    .map(|l| l.agent_id.clone())
+            });
+
+        if let Some(id) = agent_id {
+            if self.coordinator_id.as_ref() == Some(&id) {
+                self.focus = FocusTarget::Coordinator;
+            } else {
+                // Only focus if the agent actually has a tiling pane.
+                let has_pane = self.tiling.leaves().iter().any(|l| l.as_ref() == Some(&id));
+                if has_pane {
+                    self.focus = FocusTarget::Agent(id);
+                }
+            }
+        }
+    }
+
     pub fn handle_input(&mut self, event: InputEvent) {
         match event {
             InputEvent::Quit => self.running = false,
@@ -190,7 +219,32 @@ impl App {
             InputEvent::TreeDown => self.file_tree.select_next(),
             InputEvent::TreeExpand => self.file_tree.expand(),
             InputEvent::TreeCollapse => self.file_tree.collapse(),
-            InputEvent::TreeToggle => self.file_tree.toggle_expand(),
+            InputEvent::TreeToggle => {
+                // If the selected item is a directory, expand/collapse it.
+                // If it's a file, switch focus to the agent that holds it.
+                let sel_info = self.file_tree.visible.get(self.file_tree.selected)
+                    .map(|n| (n.is_dir, n.path.to_string_lossy().to_string()));
+                match sel_info {
+                    Some((true, _)) | None => self.file_tree.toggle_expand(),
+                    Some((false, path)) => {
+                        self.focus_agent_for_path(&path);
+                    }
+                }
+            }
+            InputEvent::ScrollUp => {
+                if let Some(agent_id) = self.focused_agent_id().cloned() {
+                    if let Some(term) = self.terminals.get_mut(agent_id.as_str()) {
+                        term.scroll_up();
+                    }
+                }
+            }
+            InputEvent::ScrollDown => {
+                if let Some(agent_id) = self.focused_agent_id().cloned() {
+                    if let Some(term) = self.terminals.get_mut(agent_id.as_str()) {
+                        term.scroll_down();
+                    }
+                }
+            }
             InputEvent::SpawnNewAgent => {} // Handled in run_inner (needs NATS)
             InputEvent::EnterCommandMode => {}
             InputEvent::RawInput(_) => {}
@@ -313,6 +367,9 @@ async fn run_inner(config: ForgeConfig, workdir: PathBuf) -> Result<()> {
     // Subscribe to agent state changes
     let mut state_sub = nats.subscribe(AgentSubjects::all_states()).await?;
 
+    // Subscribe to filesystem events (for incremental file tree updates)
+    let mut fs_sub = nats.subscribe(AgentSubjects::all_fs()).await?;
+
     // Main loop
     while app.running {
         // Poll NATS for agent stdout (non-blocking drain)
@@ -356,6 +413,18 @@ async fn run_inner(config: ForgeConfig, workdir: PathBuf) -> Result<()> {
                             let (acols, arows) = app.center_pane_size(term_size.width, term_size.height);
                             app.ensure_terminal(&id_str, acols, arows);
                         }
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        // Poll NATS for filesystem events — trigger incremental tree refresh.
+        loop {
+            match tokio::time::timeout(Duration::from_millis(1), fs_sub.next()).await {
+                Ok(Some(msg)) => {
+                    if serde_json::from_slice::<FsEvent>(&msg.payload).is_ok() {
+                        app.file_tree.refresh(&app.workdir);
                     }
                 }
                 _ => break,

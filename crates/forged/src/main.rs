@@ -1,6 +1,7 @@
 mod lock_manager;
 mod nats_manager;
 mod orchestration;
+mod state_detector;
 mod supervisor;
 mod system_prompt;
 
@@ -9,6 +10,7 @@ use clap::Parser;
 use forge_core::config::ForgeConfig;
 use forge_core::state_file::DaemonState;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use tracing::info;
 
 #[derive(Parser)]
@@ -60,7 +62,7 @@ async fn main() -> Result<()> {
 
     // Initialize database
     let db_path = data_dir.join("state.db");
-    let db = forge_core::db::init(&db_path)?;
+    let db = Arc::new(Mutex::new(forge_core::db::init(&db_path)?));
     info!("Database initialized at {}", db_path.display());
 
     // Start embedded NATS
@@ -85,7 +87,7 @@ async fn main() -> Result<()> {
     info!("Connected to NATS");
 
     // Start lock manager
-    let lock_handle = lock_manager::start(db, nats_client.clone(), &config.locks);
+    let lock_handle = lock_manager::start(Arc::clone(&db), nats_client.clone(), &config.locks);
     info!("Lock manager started");
 
     // Set up Ctrl+C / SIGTERM handler
@@ -115,7 +117,7 @@ async fn main() -> Result<()> {
     });
 
     // Start orchestration engine (spawns coordinator automatically)
-    orchestration::run(nats_client.clone(), config, workdir.clone(), lock_handle).await?;
+    orchestration::run(nats_client.clone(), config, workdir.clone(), lock_handle, Arc::clone(&db)).await?;
 
     // Cleanup
     info!("Shutting down...");

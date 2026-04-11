@@ -19,11 +19,10 @@ pub struct LockManagerHandle {
 
 /// Start the lock manager, listening on NATS for lock requests.
 pub fn start(
-    db: Connection,
+    db: Arc<Mutex<Connection>>,
     nats: async_nats::Client,
     config: &LockConfig,
 ) -> LockManagerHandle {
-    let db = Arc::new(Mutex::new(db));
     let idle_timeout = config.idle_timeout_secs;
 
     let task = tokio::spawn(async move {
@@ -38,10 +37,38 @@ pub fn start(
 async fn run_lock_manager(
     db: Arc<Mutex<Connection>>,
     nats: async_nats::Client,
-    _idle_timeout: u64,
+    idle_timeout: u64,
 ) -> Result<()> {
     let mut sub = nats.subscribe(FileLockSubjects::request()).await?;
     info!("Lock manager listening on {}", FileLockSubjects::request());
+
+    // Idle timeout: release locks that have been held past the configured threshold.
+    if idle_timeout > 0 {
+        let db_clone = Arc::clone(&db);
+        let nats_clone = nats.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(idle_timeout));
+            interval.tick().await; // skip the immediate first tick
+            loop {
+                interval.tick().await;
+                let stale = {
+                    let conn = db_clone.lock().unwrap();
+                    db::get_stale_lock_paths(&conn, idle_timeout).unwrap_or_default()
+                };
+                if !stale.is_empty() {
+                    for path in &stale {
+                        let conn = db_clone.lock().unwrap();
+                        let _ = db::force_release_lock(&conn, path);
+                        info!("Auto-released idle lock on {path}");
+                    }
+                    if let Err(e) = publish_lock_state(&db_clone, &nats_clone).await {
+                        warn!("Failed to broadcast lock state after idle release: {e}");
+                    }
+                }
+            }
+        });
+    }
 
     while let Some(msg) = sub.next().await {
         let request: LockRequest = match serde_json::from_slice(&msg.payload) {

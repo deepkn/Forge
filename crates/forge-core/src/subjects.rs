@@ -51,6 +51,11 @@ impl AgentSubjects {
         format!("{PREFIX}.agent.*.stdout")
     }
 
+    /// Subscribe to all agent fs event streams.
+    pub fn all_fs() -> String {
+        format!("{PREFIX}.agent.*.fs")
+    }
+
     /// MCP tool calls from an agent.
     pub fn mcp_call(id: &AgentId) -> String {
         format!("{PREFIX}.agent.{id}.mcp.call")
