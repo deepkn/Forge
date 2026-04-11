@@ -1,0 +1,19 @@
+[package]
+name = "forge-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+rusqlite = { workspace = true }
+async-nats = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+directories = { workspace = true }
+libc = { workspace = true }

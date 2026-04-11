@@ -1,0 +1,60 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/forge-cli",
+    "crates/forged",
+    "crates/forge-core", "crates/forge-mcp",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# Internal
+forge-core = { path = "crates/forge-core" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Terminal emulation
+alacritty_terminal = "0.24"
+
+# PTY
+portable-pty = "0.8"
+
+# Message bus
+async-nats = "0.39"
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# File watching
+notify = "7"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+futures-util = "0.3"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "2"
+directories = "6"
+libc = "0.2"
+scopeguard = "1"
