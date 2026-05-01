@@ -27,7 +27,7 @@ Forge is built on a client-server architecture with a central daemon and a TUI c
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/forge.git
+git clone https://github.com/deepkn/forge.git
 cd forge
 
 # Build the project
