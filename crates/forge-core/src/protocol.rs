@@ -201,6 +201,28 @@ pub enum UiEvent {
     FocusChanged { agent_id: AgentId },
     LayoutChanged { layout: String },
     PaneClosed { agent_id: AgentId },
+    /// TUI is detaching — daemon should persist the layout.
+    Detached { layout: Option<String> },
+}
+
+// ─── Remote FS Snapshot ────────────────────────────────────────────
+
+/// A snapshot of a remote agent's working directory tree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteSnapshot {
+    pub agent_id: crate::types::AgentId,
+    /// Host name (SSH alias or IP) for the remote agent.
+    pub host_name: String,
+    /// Files/directories found under the working directory.
+    pub entries: Vec<RemoteSnapshotEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteSnapshotEntry {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub depth: usize,
 }
 
 // ─── Daemon ↔ TUI handshake ────────────────────────────────────────
@@ -211,4 +233,7 @@ pub struct SessionSnapshot {
     pub agents: Vec<crate::types::AgentInfo>,
     pub locks: Vec<LockEntry>,
     pub nats_url: String,
+    /// Serialized tiling layout JSON (for re-attach).
+    #[serde(default)]
+    pub layout: Option<String>,
 }

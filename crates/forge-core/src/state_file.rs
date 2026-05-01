@@ -12,6 +12,9 @@ pub struct DaemonState {
     pub pid: u32,
     pub nats_url: String,
     pub workdir: String,
+    /// Session ID for re-attach.
+    #[serde(default)]
+    pub session_id: String,
 }
 
 impl DaemonState {

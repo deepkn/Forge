@@ -715,6 +715,7 @@ dependencies = [
  "clap",
  "forge-core",
  "futures-util",
+ "libc",
  "notify",
  "portable-pty",
  "rusqlite",

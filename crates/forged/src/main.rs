@@ -23,6 +23,10 @@ struct Cli {
     /// Working directory for the session.
     #[arg(short, long, default_value = ".")]
     workdir: PathBuf,
+
+    /// Run as a fully detached daemon (double-fork).
+    #[arg(long)]
+    daemon: bool,
 }
 
 #[tokio::main]
@@ -35,6 +39,40 @@ async fn main() -> Result<()> {
     };
 
     let workdir = std::fs::canonicalize(&cli.workdir)?;
+
+    // Double-fork to fully daemonize if --daemon was passed
+    if cli.daemon {
+        unsafe {
+            let pid = libc::fork();
+            if pid < 0 {
+                anyhow::bail!("First fork failed");
+            }
+            if pid > 0 {
+                // Parent: print child PID and exit
+                std::process::exit(0);
+            }
+            // Child: create new session
+            libc::setsid();
+            let pid2 = libc::fork();
+            if pid2 < 0 {
+                anyhow::bail!("Second fork failed");
+            }
+            if pid2 > 0 {
+                // First child exits; grandchild continues as daemon
+                std::process::exit(0);
+            }
+            // Grandchild: redirect stdin/stdout/stderr to /dev/null
+            let devnull = libc::open(b"/dev/null\0".as_ptr() as *const _, libc::O_RDWR);
+            if devnull >= 0 {
+                libc::dup2(devnull, 0);
+                libc::dup2(devnull, 1);
+                libc::dup2(devnull, 2);
+                if devnull > 2 {
+                    libc::close(devnull);
+                }
+            }
+        }
+    }
 
     // Ensure data directory exists
     let data_dir = ForgeConfig::data_dir();
@@ -69,14 +107,18 @@ async fn main() -> Result<()> {
     let nats_url = nats_manager::start_embedded_nats(&config.nats).await?;
     info!("NATS server started at {}", nats_url);
 
+    // Generate a session ID
+    let session_id = forge_core::types::SessionId::new();
+
     // Write state file so forge TUI can find us
     let state = DaemonState {
         pid: std::process::id(),
         nats_url: nats_url.clone(),
         workdir: workdir.to_string_lossy().to_string(),
+        session_id: session_id.as_str().to_string(),
     };
     state.write()?;
-    info!("State file written");
+    info!("State file written (session: {})", session_id);
 
     // Inject forge system prompt into working directory
     system_prompt::inject_system_prompt(&workdir)?;

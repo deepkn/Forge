@@ -12,9 +12,9 @@ use crossterm::terminal::{
 };
 use crossterm::ExecutableCommand;
 use forge_core::config::ForgeConfig;
-use forge_core::protocol::{AgentStateEvent, FsEvent, SessionSnapshot};
+use forge_core::protocol::{AgentStateEvent, CoordinatorCommand, FsEvent, RemoteSnapshot, SessionSnapshot, UiEvent};
 use forge_core::state_file::DaemonState;
-use forge_core::subjects::{AgentSubjects, SessionSubjects};
+use forge_core::subjects::{AgentSubjects, CoordinatorSubjects, SessionSubjects};
 use forge_core::types::{AgentId, AgentInfo};
 use futures_util::StreamExt;
 use ratatui::prelude::*;
@@ -358,6 +358,35 @@ async fn run_inner(config: ForgeConfig, workdir: PathBuf) -> Result<()> {
         app.ensure_terminal(&id_str, cols, rows);
     }
 
+    // Restore tiling layout from snapshot (if re-attaching)
+    if let Some(ref layout_json) = snapshot.layout {
+        if let Some(restored) = TilingLayout::deserialize(layout_json) {
+            app.tiling = restored;
+            app.needs_resize = true;
+        }
+    }
+
+    // Replay scrollback for each agent (request buffered output from daemon)
+    for (id_str, _) in &app.agents {
+        let cmd = CoordinatorCommand::ReadOutput {
+            agent_id: AgentId(id_str.clone()),
+            last_n_lines: 2000,
+        };
+        let payload = serde_json::to_vec(&cmd).unwrap();
+        if let Ok(reply) = nats
+            .request(
+                CoordinatorSubjects::command(),
+                payload.into(),
+            )
+            .await
+        {
+            // Feed the raw output into the terminal emulator for proper ANSI rendering
+            if let Some(term) = app.terminals.get_mut(id_str) {
+                term.process_bytes(&reply.payload);
+            }
+        }
+    }
+
     // Track last-known pane sizes to detect when resizes are needed
     let mut last_pane_sizes: HashMap<String, (u16, u16)> = HashMap::new();
 
@@ -369,6 +398,9 @@ async fn run_inner(config: ForgeConfig, workdir: PathBuf) -> Result<()> {
 
     // Subscribe to filesystem events (for incremental file tree updates)
     let mut fs_sub = nats.subscribe(AgentSubjects::all_fs()).await?;
+
+    // Subscribe to remote directory snapshots from SSH agents
+    let mut remote_snapshot_sub = nats.subscribe(AgentSubjects::all_remote_snapshots()).await?;
 
     // Main loop
     while app.running {
@@ -425,6 +457,28 @@ async fn run_inner(config: ForgeConfig, workdir: PathBuf) -> Result<()> {
                 Ok(Some(msg)) => {
                     if serde_json::from_slice::<FsEvent>(&msg.payload).is_ok() {
                         app.file_tree.refresh(&app.workdir);
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        // Poll NATS for remote directory snapshots — update remote sections in file tree.
+        loop {
+            match tokio::time::timeout(Duration::from_millis(1), remote_snapshot_sub.next()).await {
+                Ok(Some(msg)) => {
+                    if let Ok(snapshot) = serde_json::from_slice::<RemoteSnapshot>(&msg.payload) {
+                        let entries = snapshot
+                            .entries
+                            .into_iter()
+                            .map(|e| crate::file_tree::RemoteEntry {
+                                name: e.name,
+                                path: std::path::PathBuf::from(&e.path),
+                                is_dir: e.is_dir,
+                                depth: e.depth,
+                            })
+                            .collect();
+                        app.file_tree.add_remote_section(snapshot.host_name, entries);
                     }
                 }
                 _ => break,
@@ -526,6 +580,13 @@ async fn run_inner(config: ForgeConfig, workdir: PathBuf) -> Result<()> {
             }
         }
     }
+
+    // Publish detach event with current layout so daemon persists it
+    let layout_json = app.tiling.serialize();
+    let detach_event = UiEvent::Detached { layout: layout_json };
+    let payload = serde_json::to_vec(&detach_event).unwrap();
+    let _ = nats.publish(SessionSubjects::ui_events(), payload.into()).await;
+    let _ = nats.flush().await;
 
     Ok(())
 }

@@ -56,6 +56,16 @@ impl AgentSubjects {
         format!("{PREFIX}.agent.*.fs")
     }
 
+    /// Remote directory snapshot from an agent's SSH supervisor.
+    pub fn remote_snapshot(id: &AgentId) -> String {
+        format!("{PREFIX}.agent.{id}.remote_snapshot")
+    }
+
+    /// Subscribe to remote snapshots from all agents.
+    pub fn all_remote_snapshots() -> String {
+        format!("{PREFIX}.agent.*.remote_snapshot")
+    }
+
     /// MCP tool calls from an agent.
     pub fn mcp_call(id: &AgentId) -> String {
         format!("{PREFIX}.agent.{id}.mcp.call")

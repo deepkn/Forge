@@ -4,16 +4,17 @@
 //! and each branch is a split (horizontal or vertical).
 
 use forge_core::types::AgentId;
+use serde::{Deserialize, Serialize};
 
 /// Direction of a split.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SplitDirection {
     Horizontal,
     Vertical,
 }
 
 /// Node in the tiling tree.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum TilingNode {
     Leaf {
         agent_id: Option<AgentId>,
@@ -171,6 +172,31 @@ impl TilingLayout {
         }
         result
     }
+
+    /// Serialize the tiling layout to a JSON string for session persistence.
+    pub fn serialize(&self) -> Option<String> {
+        let root = self.root.as_ref()?;
+        serde_json::to_string(&LayoutSnapshot {
+            root: root,
+            focused_index: self.focused_index,
+        }).ok()
+    }
+
+    /// Deserialize a tiling layout from a JSON string (on re-attach).
+    pub fn deserialize(s: &str) -> Option<Self> {
+        let snapshot: OwnedLayoutSnapshot = serde_json::from_str(s).ok()?;
+        let pane_count = count_leaves(&snapshot.root);
+        let focused_index = if snapshot.focused_index < pane_count {
+            snapshot.focused_index
+        } else {
+            0
+        };
+        Some(Self {
+            root: Some(snapshot.root),
+            focused_index,
+            pane_count,
+        })
+    }
 }
 
 /// Split the leaf at the given index into a split with two leaves.
@@ -286,4 +312,25 @@ fn collect_leaves(node: &TilingNode, out: &mut Vec<Option<AgentId>>) {
             collect_leaves(second, out);
         }
     }
+}
+
+fn count_leaves(node: &TilingNode) -> usize {
+    match node {
+        TilingNode::Leaf { .. } => 1,
+        TilingNode::Split { first, second, .. } => count_leaves(first) + count_leaves(second),
+    }
+}
+
+/// Snapshot structure for serialization (borrows the tree).
+#[derive(Serialize)]
+struct LayoutSnapshot<'a> {
+    root: &'a TilingNode,
+    focused_index: usize,
+}
+
+/// Owned snapshot for deserialization.
+#[derive(Deserialize)]
+struct OwnedLayoutSnapshot {
+    root: TilingNode,
+    focused_index: usize,
 }

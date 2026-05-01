@@ -2,11 +2,12 @@
 
 use crate::lock_manager::LockManagerHandle;
 use crate::supervisor::local::LocalSupervisor;
+use crate::supervisor::ssh::SshSupervisor;
 use crate::supervisor::Supervisor;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use forge_core::config::{AgentType, ForgeConfig};
-use forge_core::protocol::{AgentStateEvent, CoordinatorCommand, CoordinatorNotification, FsAction, FsEvent, SessionSnapshot};
+use forge_core::protocol::{AgentStateEvent, CoordinatorCommand, CoordinatorNotification, FsAction, FsEvent, SessionSnapshot, UiEvent};
 use forge_core::subjects::{AgentSubjects, CoordinatorInbox, CoordinatorSubjects, SessionSubjects};
 use forge_core::types::{AgentColor, AgentHost, AgentId, AgentInfo, AgentState};
 use forge_core::db;
@@ -18,7 +19,8 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 /// Per-agent output ring buffer (last N lines).
-const OUTPUT_BUFFER_LINES: usize = 200;
+/// Sized for rich scrollback on re-attach.
+const OUTPUT_BUFFER_LINES: usize = 2000;
 
 struct AgentEntry {
     info: AgentInfo,
@@ -102,20 +104,51 @@ pub async fn run(
         }
     });
 
+    // Shared layout state (persisted on detach, sent on attach)
+    let last_layout: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let layout_for_session = last_layout.clone();
+    let layout_for_ui = last_layout.clone();
+
     // Handle session handshake requests in background
     tokio::spawn(async move {
         while let Some(msg) = session_sub.next().await {
             if let Some(reply) = msg.reply {
                 let agents = agents_for_session.lock().await;
                 let agent_list: Vec<AgentInfo> = agents.values().map(|e| e.info.clone()).collect();
+                let layout = layout_for_session.lock().await.clone();
                 let snapshot = SessionSnapshot {
                     session_id: "default".to_string(),
                     agents: agent_list,
                     locks: Vec::new(),
                     nats_url: String::new(),
+                    layout,
                 };
                 let payload = serde_json::to_vec(&snapshot).unwrap();
                 let _ = nats_for_session.publish(reply, payload.into()).await;
+            }
+        }
+    });
+
+    // Subscribe to UI events (detach, focus changes, etc.)
+    let mut ui_sub = nats.subscribe(SessionSubjects::ui_events()).await?;
+    let db_for_ui = Arc::clone(&db);
+    tokio::spawn(async move {
+        while let Some(msg) = ui_sub.next().await {
+            if let Ok(event) = serde_json::from_slice::<UiEvent>(&msg.payload) {
+                match event {
+                    UiEvent::Detached { layout } => {
+                        info!("TUI detached, persisting layout");
+                        if let Some(ref layout_json) = layout {
+                            // Store in memory for next attach
+                            *layout_for_ui.lock().await = Some(layout_json.clone());
+                            // Persist to SQLite
+                            let conn = db_for_ui.lock().unwrap();
+                            let session_id = forge_core::types::SessionId("default".to_string());
+                            let _ = db::update_session_layout(&conn, &session_id, layout_json);
+                        }
+                    }
+                    _ => {} // Other UI events handled elsewhere
+                }
             }
         }
     });
@@ -366,6 +399,7 @@ async fn spawn_agent_full(
                 pid: 0,
                 nats_url: "nats://127.0.0.1:4222".to_string(),
                 workdir: String::new(),
+                session_id: String::new(),
             }
         });
 
@@ -451,7 +485,58 @@ async fn spawn_agent_full(
             }
         }
         AgentHost::Remote { name } => {
-            anyhow::bail!("Remote agents not yet implemented (host: {name})");
+            // Extract NATS port from state file for reverse tunnel
+            let daemon_state = forge_core::state_file::DaemonState::read()?
+                .context("Cannot spawn remote agent: daemon state file not found")?;
+            let nats_port: u16 = daemon_state.nats_url
+                .rsplit(':')
+                .next()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(4222);
+
+            let mut supervisor = SshSupervisor::new(
+                agent_id.clone(),
+                name.clone(),
+                cmd,
+                cmd_args,
+                working_dir,
+                nats_port,
+            );
+            supervisor.start_with_nats(nats.clone()).await?;
+
+            let mut agents = agents.lock().await;
+            agents.insert(
+                agent_id.as_str().to_string(),
+                AgentEntry {
+                    info,
+                    supervisor: Box::new(supervisor),
+                    output_buffer: VecDeque::new(),
+                },
+            );
+
+            let event = AgentStateEvent {
+                agent_id: agent_id.clone(),
+                state: AgentState::Running,
+                message: Some(format!("Running on remote host: {name}")),
+            };
+            let payload = serde_json::to_vec(&event).unwrap();
+            let _ = nats.publish(AgentSubjects::state(&agent_id), payload.into()).await;
+
+            // Inject initial task if provided
+            if let Some(task_text) = task {
+                let nats_clone = nats.clone();
+                let agent_id_clone = agent_id.clone();
+                tokio::spawn(async move {
+                    // Longer delay for SSH initialization
+                    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                    let _ = nats_clone
+                        .publish(
+                            AgentSubjects::stdin(&agent_id_clone),
+                            format!("{task_text}\n").into(),
+                        )
+                        .await;
+                });
+            }
         }
     }
 

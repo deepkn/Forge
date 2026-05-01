@@ -1,6 +1,6 @@
 //! File tree data model — maintains directory structure and agent overlays.
 
-use forge_core::types::{AgentId, LockMode};
+use forge_core::types::{AgentHost, AgentId, LockMode};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -35,6 +35,25 @@ pub struct FileTreeState {
     pub active_edits: HashMap<String, AgentId>,
     /// Whether the detail section is expanded for the selected file.
     pub detail_expanded: bool,
+    /// Remote host file sections.
+    pub remote_sections: Vec<RemoteSection>,
+}
+
+/// A section of the file tree for a remote host.
+#[derive(Debug, Clone)]
+pub struct RemoteSection {
+    pub host_name: String,
+    pub entries: Vec<RemoteEntry>,
+    pub expanded: bool,
+}
+
+/// A file/directory entry from a remote host.
+#[derive(Debug, Clone)]
+pub struct RemoteEntry {
+    pub name: String,
+    pub path: PathBuf,
+    pub is_dir: bool,
+    pub depth: usize,
 }
 
 /// A flattened node for rendering.
@@ -45,6 +64,10 @@ pub struct VisibleNode {
     pub is_dir: bool,
     pub depth: usize,
     pub expanded: bool,
+    /// Which host this node belongs to.
+    pub host: AgentHost,
+    /// True if this is a host section header (not a real file).
+    pub is_section_header: bool,
 }
 
 impl FileTreeState {
@@ -56,6 +79,7 @@ impl FileTreeState {
             locks: HashMap::new(),
             active_edits: HashMap::new(),
             detail_expanded: false,
+            remote_sections: Vec::new(),
         }
     }
 
@@ -95,12 +119,44 @@ impl FileTreeState {
         }
     }
 
-    /// Rebuild the flattened visible list from the tree.
+    /// Rebuild the flattened visible list from all sections.
     pub fn rebuild_visible(&mut self) {
         self.visible.clear();
+
+        // Local section
         if let Some(ref root) = self.root {
-            flatten_tree(root, &mut self.visible);
+            flatten_tree(root, &mut self.visible, &AgentHost::Local);
         }
+
+        // Remote sections
+        for section in &self.remote_sections {
+            // Add section header
+            self.visible.push(VisibleNode {
+                name: format!("🌐 {}", section.host_name),
+                path: PathBuf::from(&section.host_name),
+                is_dir: true,
+                depth: 0,
+                expanded: section.expanded,
+                host: AgentHost::Remote { name: section.host_name.clone() },
+                is_section_header: true,
+            });
+
+            if section.expanded {
+                let host = AgentHost::Remote { name: section.host_name.clone() };
+                for entry in &section.entries {
+                    self.visible.push(VisibleNode {
+                        name: entry.name.clone(),
+                        path: entry.path.clone(),
+                        is_dir: entry.is_dir,
+                        depth: entry.depth + 1, // indent under header
+                        expanded: false,
+                        host: host.clone(),
+                        is_section_header: false,
+                    });
+                }
+            }
+        }
+
         // Clamp selection
         if !self.visible.is_empty() && self.selected >= self.visible.len() {
             self.selected = self.visible.len() - 1;
@@ -203,6 +259,35 @@ impl FileTreeState {
     pub fn clear_active_edit(&mut self, path: &str) {
         self.active_edits.remove(path);
     }
+
+    /// Add or update a remote host section from a file listing.
+    pub fn add_remote_section(&mut self, host_name: String, entries: Vec<RemoteEntry>) {
+        // Remove existing section for this host
+        self.remote_sections.retain(|s| s.host_name != host_name);
+        self.remote_sections.push(RemoteSection {
+            host_name,
+            entries,
+            expanded: true,
+        });
+        self.rebuild_visible();
+    }
+
+    /// Remove a remote host section.
+    pub fn remove_remote_section(&mut self, host_name: &str) {
+        self.remote_sections.retain(|s| s.host_name != host_name);
+        self.rebuild_visible();
+    }
+
+    /// Toggle a remote section's expanded state.
+    pub fn toggle_remote_section(&mut self, host_name: &str) {
+        for section in &mut self.remote_sections {
+            if section.host_name == host_name {
+                section.expanded = !section.expanded;
+                break;
+            }
+        }
+        self.rebuild_visible();
+    }
 }
 
 /// Scan a directory recursively up to max_depth.
@@ -258,18 +343,20 @@ fn scan_directory(path: &Path, depth: usize, max_initial_depth: usize) -> TreeNo
 }
 
 /// Flatten the tree into a list of visible nodes (respecting expanded state).
-fn flatten_tree(node: &TreeNode, out: &mut Vec<VisibleNode>) {
+fn flatten_tree(node: &TreeNode, out: &mut Vec<VisibleNode>, host: &AgentHost) {
     out.push(VisibleNode {
         name: node.name.clone(),
         path: node.path.clone(),
         is_dir: node.is_dir,
         depth: node.depth,
         expanded: node.expanded,
+        host: host.clone(),
+        is_section_header: false,
     });
 
     if node.is_dir && node.expanded {
         for child in &node.children {
-            flatten_tree(child, out);
+            flatten_tree(child, out, host);
         }
     }
 }

@@ -61,6 +61,19 @@ pub fn render(
 
             let mut spans = Vec::new();
 
+            // Section headers for remote hosts get distinct rendering
+            if node.is_section_header {
+                let header_style = if is_selected && focused {
+                    Style::default().fg(Color::White).bg(Color::DarkGray).bold()
+                } else {
+                    Style::default().fg(Color::Cyan).bold()
+                };
+                let icon = if node.expanded { "▼ " } else { "▶ " };
+                spans.push(Span::styled(icon, Style::default().fg(Color::Cyan)));
+                spans.push(Span::styled(&node.name, header_style));
+                return ListItem::new(Line::from(spans));
+            }
+
             // Indent
             let indent = "  ".repeat(node.depth);
             spans.push(Span::raw(indent));

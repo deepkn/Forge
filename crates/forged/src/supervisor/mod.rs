@@ -1,4 +1,5 @@
 pub mod local;
+pub mod ssh;
 
 use anyhow::Result;
 use forge_core::types::AgentId;
